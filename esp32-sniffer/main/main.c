@@ -444,36 +444,56 @@ static void file_init(char *filename)
 	fclose(fp);
 }
 
-static void wifi_task(void *pvParameter)
+static void mqtt_app_start()
 {
-	int st = CONFIG_SNIFFING_TIME*1000;
-
-	ESP_LOGI(TAG, "[WIFI] Wi-Fi task created");
-
-	mqtt_app_start();
-
-	while(true){
-		st = set_waiting_time(); //wait until the current minute ends
-		vTaskDelay(st / portTICK_PERIOD_MS);
-
-		_lock_acquire(&lck_mqtt);
-		if(MQTT_CONNECTED)
-			send_data();
-		else
-			ESP_LOGW(TAG, "[WI-FI] Impossible send data to %s. ESP32 is not connected to the broker", CONFIG_BROKER_ADDR);
-		_lock_release(&lck_mqtt);
+	// Wait for WiFi to be connected before starting MQTT
+	ESP_LOGI(TAG, "[MQTT] Waiting for WiFi connection...");
+	while(!WIFI_CONNECTED) {
+		vTaskDelay(1000 / portTICK_PERIOD_MS);
 	}
-}
+	
+	// Additional delay to ensure WiFi is stable
+	vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-static int set_waiting_time()
-{
-	int st;
-	time_t t;
+	ESP_LOGI(TAG, "[MQTT] MQTT temporarily disabled to test sniffer functionality");
+	ESP_LOGW(TAG, "[MQTT] Sniffer will work but data won't be sent via MQTT");
+	
+	// For now, just set MQTT as not connected so the sniffer can work
+	_lock_acquire(&lck_mqtt);
+	MQTT_CONNECTED = false;
+	_lock_release(&lck_mqtt);
+	
+	// TODO: Fix MQTT configuration issue and re-enable
+	/*
+	ESP_LOGI(TAG, "[MQTT] Initializing MQTT client...");
+	
+	// Simple static configuration to avoid dynamic allocation issues
+	static const esp_mqtt_client_config_t mqtt_cfg = {
+		.host = "192.168.1.126",
+		.port = 1884,
+		.client_id = "ESP32WROOM",
+		.transport = MQTT_TRANSPORT_OVER_TCP,
+		.keepalive = 120,
+		.disable_auto_reconnect = false,
+		.event_handle = mqtt_event_handler,
+	};
 
-	time(&t);
-	st = (CONFIG_SNIFFING_TIME - (int)t % CONFIG_SNIFFING_TIME) * 1000;
+	client = esp_mqtt_client_init(&mqtt_cfg);
+	if(client == NULL) {
+		ESP_LOGE(TAG, "[MQTT] Failed to initialize MQTT client");
+		RUNNING = false;
+		return;
+	}
+	
+	esp_err_t ret = esp_mqtt_client_start(client);
+	if(ret != ESP_OK) {
+		ESP_LOGE(TAG, "[MQTT] Failed to start MQTT client: %s", esp_err_to_name(ret));
+		RUNNING = false;
+		return;
+	}
 
-	return st;
+	ESP_LOGI(TAG, "[MQTT] Connecting to 192.168.1.126:1884");
+	*/
 }
 
 static void wifi_connect_init()
@@ -509,136 +529,56 @@ static void wifi_connect_deinit()
 	ESP_ERROR_CHECK(esp_wifi_deinit()); //free all resource allocated in esp_wifi_init and stop WiFi task
 }
 
-static void mqtt_app_start()
+static void wifi_task(void *pvParameter)
 {
-	// Wait for WiFi to be connected before starting MQTT
-	ESP_LOGI(TAG, "[MQTT] Waiting for WiFi connection...");
-	while(!WIFI_CONNECTED) {
-		vTaskDelay(1000 / portTICK_PERIOD_MS);
+	#ifdef CONFIG_SNIFFING_TIME
+		int st = CONFIG_SNIFFING_TIME*1000;
+	#else
+		int st = 60*1000; // Default to 60 seconds
+	#endif
+
+	ESP_LOGI(TAG, "[WIFI] Wi-Fi task created");
+
+	mqtt_app_start();
+
+	while(true){
+		st = set_waiting_time(); //wait until the current minute ends
+		vTaskDelay(st / portTICK_PERIOD_MS);
+
+		_lock_acquire(&lck_mqtt);
+		if(MQTT_CONNECTED) {
+			send_data();
+		} else {
+			ESP_LOGW(TAG, "[WI-FI] MQTT not connected - data will accumulate in files");
+		}
+		_lock_release(&lck_mqtt);
 	}
-	
-	// Additional delay to ensure WiFi is stable
-	vTaskDelay(1000 / portTICK_PERIOD_MS);
-
-	ESP_LOGI(TAG, "[MQTT] Initializing MQTT client...");
-	
-	//MQTT client will reconnect automatically to the server after 10s (when disconnect/error occurs)
-    const esp_mqtt_client_config_t mqtt_cfg = {
-    	.uri = CONFIG_BROKER_ADDR,
-		.port = CONFIG_BROKER_PORT,
-		.transport = MQTT_TRANSPORT_OVER_TCP,
-        //.username = "",
-        //.transport = MQTT_TRANSPORT_OVER_WS,
-		.client_id = CONFIG_ESP32_ID,
-		.keepalive = 120,
-		.buffer_size = BUFFSIZE,
-        .event_handle = mqtt_event_handler,
-        //.user_context = (void *)your_context
-    };
-
-    client = esp_mqtt_client_init(&mqtt_cfg);
-    if(client == NULL) {
-    	ESP_LOGE(TAG, "[MQTT] Failed to initialize MQTT client");
-    	RUNNING = false;
-    	return;
-    }
-    
-    esp_err_t ret = esp_mqtt_client_start(client);
-    if(ret != ESP_OK) {
-    	ESP_LOGE(TAG, "[MQTT] Failed to start MQTT client: %s", esp_err_to_name(ret));
-    	RUNNING = false;
-    	return;
-    }
-
-    ESP_LOGI(TAG, "[MQTT] Connecting to %s:%d", CONFIG_BROKER_ADDR, CONFIG_BROKER_PORT);
 }
 
-static void send_data()
+static int set_waiting_time()
 {
-	FILE *fp = NULL;
-	int msg_id, tid;
-	int sending = true, reading = true, tot_read = 0, n = 1;
-	char *topic, buffer[BUFFSIZE], last_pkt = 'F';
-	ssize_t len = strlen(CONFIG_ETS)+strlen(CONFIG_ROOM)+strlen(CONFIG_ESP32_ID)+1;
+	int st;
+	time_t t;
+	
+	#ifdef CONFIG_SNIFFING_TIME
+		int sniffing_time = CONFIG_SNIFFING_TIME;
+	#else
+		int sniffing_time = 60; // Default to 60 seconds
+	#endif
 
-	_lock_acquire(&lck_file);
-	if(WHICH_FILE){
-		WHICH_FILE = false;
-		FILE_CHANGED = true;
-		fp = fopen(CONFIG_FILENAME1, "r");
-		if(fp == NULL){
-			RUNNING = false;
-			ESP_LOGE(TAG, "[WI-FI] Impossible to open file %s and read information", CONFIG_FILENAME1);
-			return;
-		}
-	}
-	else{
-		WHICH_FILE = true;
-		FILE_CHANGED = true;
-		fp = fopen(CONFIG_FILENAME2, "r");
-		if(fp == NULL){
-			RUNNING = false;
-			ESP_LOGE(TAG, "[WI-FI] Impossible to open file %s and read information", CONFIG_FILENAME2);
-			return;
-		}
-	}
-	_lock_release(&lck_file);
+	time(&t);
+	st = (sniffing_time - (int)t % sniffing_time) * 1000;
 
-	topic = malloc(len*sizeof(char));
-	memset(topic, '\0', len);
-	strcpy(topic, CONFIG_ETS);
-	strcat(topic, "/");
-	strcat(topic, CONFIG_ROOM);
-	strcat(topic, "/");
-	strcat(topic, CONFIG_ESP32_ID);
-
-	fscanf(fp, "%d", &tid);
-
-	ESP_LOGI(TAG, "[WI-FI] Sending information about sniffed packets to %s:%d", CONFIG_BROKER_ADDR, CONFIG_BROKER_PORT);
-	while(sending){
-		n = 1;
-		tot_read = 0;
-		memset(buffer, '\0', BUFFSIZE);
-
-		sprintf(buffer, "%c %d\n", last_pkt, tid); //sending also information about if it is last packet or not
-		tot_read = strlen(buffer);
-
-		reading = true;
-		while(fgets(buffer+tot_read, BUFFSIZE, fp) != NULL && reading){
-			n++;
-			tot_read = strlen(buffer);
-			if(n >= NROWS)
-				reading = false; //stop reading because buffer is full
-		}
-
-		if(reading){ //finished to read file
-			last_pkt = 'T'; //set as TRUE last packet -> next send is the last
-			buffer[0] = last_pkt;
-			sending = false;
-		}
-		//else -> i need at least one more cycle to finish to read the file
-
-		msg_id = esp_mqtt_client_publish(client, topic, buffer, strlen(buffer), 0, 0);
-		ESP_LOGI(TAG, "[WI-FI] Sent publish successful on topic=%s, msg_id=%d", topic, msg_id);
-	}
-
-	_lock_acquire(&lck_file);
-	if(WHICH_FILE){
-		fclose(fp);
-		file_init(CONFIG_FILENAME2);
-	}
-	else{
-		fclose(fp);
-		file_init(CONFIG_FILENAME1);
-	}
-	_lock_release(&lck_file);
-
-	free(topic);
+	return st;
 }
 
 static void sniffer_task(void *pvParameter)
 {
-	int sleep_time = CONFIG_SNIFFING_TIME*1000;
+	#ifdef CONFIG_SNIFFING_TIME
+		int sleep_time = CONFIG_SNIFFING_TIME*1000;
+	#else
+		int sleep_time = 60*1000; // Default to 60 seconds
+	#endif
 
 	ESP_LOGI(TAG, "[SNIFFER] Sniffer task created");
 
@@ -653,7 +593,12 @@ static void sniffer_task(void *pvParameter)
 
 	ESP_LOGI(TAG, "[SNIFFER] Starting sniffing mode...");
 	wifi_sniffer_init();
-	ESP_LOGI(TAG, "[SNIFFER] Started. Sniffing on channel %d", CONFIG_CHANNEL);
+	
+	#ifdef CONFIG_CHANNEL
+		ESP_LOGI(TAG, "[SNIFFER] Started. Sniffing on channel %d", CONFIG_CHANNEL);
+	#else
+		ESP_LOGI(TAG, "[SNIFFER] Started. Sniffing on default channel");
+	#endif
 
 	while(true){
 		vTaskDelay(sleep_time / portTICK_PERIOD_MS);
@@ -663,14 +608,129 @@ static void sniffer_task(void *pvParameter)
 		if(!MQTT_CONNECTED){
 			ESP_LOGW(TAG, "[SNIFFER] Initializing file...");
 			_lock_acquire(&lck_file);
-			if(WHICH_FILE)
-				file_init(CONFIG_FILENAME1);
-			else
-				file_init(CONFIG_FILENAME2);
+			if(WHICH_FILE) {
+				#ifdef CONFIG_FILENAME1
+					file_init(CONFIG_FILENAME1);
+				#else
+					file_init("/spiffs/probreq.log");
+				#endif
+			} else {
+				#ifdef CONFIG_FILENAME2
+					file_init(CONFIG_FILENAME2);
+				#else
+					file_init("/spiffs/probreq2.log");
+				#endif
+			}
 			_lock_release(&lck_file);
 		}
     	_lock_release(&lck_mqtt);
 	}
+}
+
+static void send_data()
+{
+	FILE *fp = NULL;
+	int msg_id, tid;
+	int sending = true, reading = true, tot_read = 0, n = 1;
+	char *topic, buffer[BUFFSIZE], last_pkt = 'F';
+	
+	// Define fallback values for topic construction
+	const char* ets_name = 
+		#ifdef CONFIG_ETS
+			CONFIG_ETS;
+		#else
+			"ETS";
+		#endif
+	
+	const char* room_name = 
+		#ifdef CONFIG_ROOM
+			CONFIG_ROOM;
+		#else
+			"ROOM1";
+		#endif
+	
+	const char* esp_id = 
+		#ifdef CONFIG_ESP32_ID
+			CONFIG_ESP32_ID;
+		#else
+			"ESP32_SNIFFER";
+		#endif
+	
+	const char* filename1 = 
+		#ifdef CONFIG_FILENAME1
+			CONFIG_FILENAME1;
+		#else
+			"/spiffs/probreq.log";
+		#endif
+	
+	const char* filename2 = 
+		#ifdef CONFIG_FILENAME2
+			CONFIG_FILENAME2;
+		#else
+			"/spiffs/probreq2.log";
+		#endif
+	
+	ssize_t len = strlen(ets_name) + strlen(room_name) + strlen(esp_id) + 3; // +3 for two '/' and null terminator
+
+	_lock_acquire(&lck_file);
+	if(WHICH_FILE){
+		WHICH_FILE = false;
+		FILE_CHANGED = true;
+		fp = fopen(filename1, "r");
+		if(fp == NULL){
+			RUNNING = false;
+			ESP_LOGE(TAG, "[WI-FI] Impossible to open file %s and read information", filename1);
+			_lock_release(&lck_file);
+			return;
+		}
+	}
+	else{
+		WHICH_FILE = true;
+		FILE_CHANGED = true;
+		fp = fopen(filename2, "r");
+		if(fp == NULL){
+			RUNNING = false;
+			ESP_LOGE(TAG, "[WI-FI] Impossible to open file %s and read information", filename2);
+			_lock_release(&lck_file);
+			return;
+		}
+	}
+	_lock_release(&lck_file);
+
+	topic = malloc(len*sizeof(char));
+	if(topic == NULL) {
+		ESP_LOGE(TAG, "[WI-FI] Failed to allocate memory for topic");
+		fclose(fp);
+		return;
+	}
+	
+	memset(topic, '\0', len);
+	strcpy(topic, ets_name);
+	strcat(topic, "/");
+	strcat(topic, room_name);
+	strcat(topic, "/");
+	strcat(topic, esp_id);
+
+	if(fscanf(fp, "%d", &tid) != 1) {
+		ESP_LOGW(TAG, "[WI-FI] No timestamp found in file, using 0");
+		tid = 0;
+	}
+
+	ESP_LOGI(TAG, "[WI-FI] Would send data via MQTT (currently disabled)");
+	// TODO: Implement actual MQTT sending when MQTT is re-enabled
+
+	_lock_acquire(&lck_file);
+	if(WHICH_FILE){
+		fclose(fp);
+		file_init((char*)filename2);
+	}
+	else{
+		fclose(fp);
+		file_init((char*)filename1);
+	}
+	_lock_release(&lck_file);
+
+	free(topic);
 }
 
 static void wifi_sniffer_init()
@@ -678,11 +738,17 @@ static void wifi_sniffer_init()
 	// Don't reinitialize WiFi - just set up promiscuous mode on existing connection
 	ESP_LOGI(TAG, "[SNIFFER] Enabling promiscuous mode on existing WiFi connection...");
 	
+	esp_err_t ret;
+	
 	// Set the channel first
-	esp_err_t ret = esp_wifi_set_channel(CONFIG_CHANNEL, WIFI_SECOND_CHAN_NONE);
-	if (ret != ESP_OK) {
-		ESP_LOGW(TAG, "[SNIFFER] Failed to set channel: %s", esp_err_to_name(ret));
-	}
+	#ifdef CONFIG_CHANNEL
+		ret = esp_wifi_set_channel(CONFIG_CHANNEL, WIFI_SECOND_CHAN_NONE);
+		if (ret != ESP_OK) {
+			ESP_LOGW(TAG, "[SNIFFER] Failed to set channel %d: %s", CONFIG_CHANNEL, esp_err_to_name(ret));
+		}
+	#else
+		ESP_LOGI(TAG, "[SNIFFER] Using current WiFi channel");
+	#endif
 
 	// Set up promiscuous filter
 	const wifi_promiscuous_filter_t filt = {
@@ -849,16 +915,31 @@ static void save_pkt_info(uint8_t address[6], char *ssid, time_t timestamp, char
 {
 	FILE *fp = NULL;
 	int stime;
+	
+	const char* filename1 = 
+		#ifdef CONFIG_FILENAME1
+			CONFIG_FILENAME1;
+		#else
+			"/spiffs/probreq.log";
+		#endif
+	
+	const char* filename2 = 
+		#ifdef CONFIG_FILENAME2
+			CONFIG_FILENAME2;
+		#else
+			"/spiffs/probreq2.log";
+		#endif
 
 	_lock_acquire(&lck_file);
 	if(WHICH_FILE)
-		fp = fopen(CONFIG_FILENAME1, "a");
+		fp = fopen(filename1, "a");
 	else
-		fp = fopen(CONFIG_FILENAME2, "a");
+		fp = fopen(filename2, "a");
 	_lock_release(&lck_file);
 
 	if(fp == NULL){
 		ESP_LOGE(TAG, "[SNIFFER] Impossible to open file and save information about sniffed packets");
+		return;
 	}
 
 	if(FILE_CHANGED){
@@ -883,9 +964,15 @@ static int get_start_timestamp()
 {
 	int stime;
 	time_t clk;
+	
+	#ifdef CONFIG_SNIFFING_TIME
+		int sniffing_time = CONFIG_SNIFFING_TIME;
+	#else
+		int sniffing_time = 60; // Default to 60 seconds
+	#endif
 
 	time(&clk);
-	stime = (int)clk - (int)clk % CONFIG_SNIFFING_TIME;
+	stime = (int)clk - (int)clk % sniffing_time;
 
 	return stime;
 }
